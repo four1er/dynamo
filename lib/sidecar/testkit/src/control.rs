@@ -42,6 +42,8 @@ pub enum StreamAction {
     Close,
     Fail,
     ReplayFirst,
+    /// Fail the stream with [`Protocol::invalid_argument_error`].
+    Reject,
 }
 
 #[derive(Clone, Copy)]
@@ -55,6 +57,8 @@ pub struct StreamFault {
 pub struct RequestPlan {
     pub open: OpenAction,
     pub stream: Option<StreamFault>,
+    /// Replaces the default text of [`OpenAction::Reject`] and [`StreamAction::Reject`].
+    pub rejection: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -231,7 +235,11 @@ impl<P: Protocol> Controller<P> {
             OpenAction::Fail => return Err(P::injected_error("injected open failure")),
             OpenAction::Reject => {
                 return Err(P::invalid_argument_error(
-                    "injected native request rejection",
+                    handle
+                        .0
+                        .plan
+                        .rejection
+                        .unwrap_or("injected native request rejection"),
                 ));
             }
             OpenAction::Hold => handle.0.release.notified().await,
@@ -295,6 +303,13 @@ impl<P: Protocol> OpenedRequest<P> {
                             StreamAction::Continue => {}
                             StreamAction::Close => return,
                             StreamAction::Fail => Err(P::injected_error("injected read failure"))?,
+                            StreamAction::Reject => Err(P::invalid_argument_error(
+                                handle
+                                    .0
+                                    .plan
+                                    .rejection
+                                    .unwrap_or("injected native request rejection"),
+                            ))?,
                             StreamAction::ReplayFirst => {
                                 yield first.take().expect("Mocker generated tokens");
                                 futures::future::pending::<()>().await;

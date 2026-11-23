@@ -7,7 +7,7 @@ use tonic_v14 as tonic;
 use std::future::Future;
 use std::time::Duration;
 
-use dynamo_backend_common::DynamoError;
+use dynamo_backend_common::{BackendError, DynamoError, ErrorType};
 use dynamo_sidecar_common::v14::GrpcChannelPool;
 use dynamo_sidecar_common::{DEFAULT_MAX_GRPC_MESSAGE_SIZE, GrpcEndpoint, GrpcTransportConfig};
 use tokio::time::{Instant, sleep_until, timeout_at};
@@ -181,7 +181,7 @@ impl VllmClient {
             .generate_stream(request)
             .await
             .map(tonic::Response::into_inner)
-            .map_err(|status| stream_status_to_dynamo("GenerateStream", status))
+            .map_err(|status| generation_status_to_dynamo("GenerateStream", status))
     }
 
     pub(crate) async fn kv_event_sources(&self) -> Result<Vec<pb::KvEventSource>, DynamoError> {
@@ -336,5 +336,251 @@ async fn lora_rpc<T>(
             code: tonic::Code::DeadlineExceeded,
             message: format!("{rpc} exceeded the {LORA_RPC_DEADLINE:?} lifecycle deadline"),
         }),
+    }
+}
+
+const EMPTY_GRAMMAR: &str = "Invalid grammar: grammar must not be empty";
+const EMPTY_SCHEMA: &str = "Invalid JSON schema: schema must not be empty";
+const EMPTY_ENUM: &str = "Invalid JSON schema: enum array must not be empty";
+const UNSATISFIABLE_SCHEMA: &str = "Invalid JSON schema: a required property is unsatisfiable";
+const INVALID_SCHEMA: &str = "Invalid JSON schema";
+const INVALID_CONSTRAINT: &str = "Invalid structured-output constraint";
+
+/// Map a generate-stream status. Recognized structured-output failures get an
+/// authored public reason; the gRPC text stays diagnostic so compiler paths and
+/// unknown statuses cannot reach the client.
+pub(crate) fn generation_status_to_dynamo(rpc: &str, status: tonic::Status) -> DynamoError {
+    let public = structured_output_public_reason(status.code(), status.message());
+    let mut error = stream_status_to_dynamo(rpc, status);
+    if let Some(message) = public
+        && error.error_type() == ErrorType::Backend(BackendError::InvalidArgument)
+    {
+        error.public = Some(dynamo_runtime::error::PublicDetails::Message {
+            message: message.to_owned(),
+        });
+    }
+    error
+}
+
+fn structured_output_public_reason(code: tonic::Code, message: &str) -> Option<&'static str> {
+    if code != tonic::Code::InvalidArgument {
+        return None;
+    }
+    let (compiler_log, stripped) = without_compiler_logs(message);
+    let text = stripped.trim();
+    if text.contains("structured_outputs.grammar cannot be an empty string") {
+        return Some(EMPTY_GRAMMAR);
+    }
+    if text.contains("structured_outputs.json cannot be an empty string") {
+        return Some(EMPTY_SCHEMA);
+    }
+    if text == "enum array must not be empty" || text.ends_with(": enum array must not be empty") {
+        return Some(EMPTY_ENUM);
+    }
+    if text.contains("Unsatisfiable schema: required property '")
+        && text.ends_with("' is unsatisfiable")
+    {
+        return Some(UNSATISFIABLE_SCHEMA);
+    }
+    if text.contains("Invalid JSON grammar specification.") || text.contains("invalid json schema:")
+    {
+        return Some(INVALID_SCHEMA);
+    }
+    if compiler_log
+        || text.contains("Failed to transform json schema into a grammar:")
+        || text.contains("Grammar error:")
+        || recognized_structured_output_sentence(text)
+    {
+        return Some(INVALID_CONSTRAINT);
+    }
+    None
+}
+
+fn recognized_structured_output_sentence(text: &str) -> bool {
+    [
+        "structured_outputs.choice cannot be empty",
+        "must not contain a NUL character",
+        "structural_tag cannot be an empty string",
+        "Invalid structural tag specification.",
+        "features not supported by xgrammar",
+        "does not support json_object",
+        "does not support grammar specifications",
+        "does not support structural_tag",
+        "only supports structural tags with `structures` and `triggers`",
+        "nested too deeply",
+        "json_object must be true if set",
+        "multiple structured output constraints specified",
+        "missing structured output constraint",
+    ]
+    .iter()
+    .any(|sentence| text.contains(sentence))
+}
+
+/// Strip vLLM/xgrammar locations of the form `[HH:MM:SS] /path/file.cc:1: `.
+fn without_compiler_logs(message: &str) -> (bool, &str) {
+    let mut rest = message;
+    let mut found = false;
+    while let Some(stripped) = strip_compiler_log_prefix(rest) {
+        found = true;
+        rest = stripped;
+    }
+    (found, rest.trim())
+}
+
+fn strip_compiler_log_prefix(message: &str) -> Option<&str> {
+    let rest = message.trim_start();
+    let bytes = rest.as_bytes();
+    if bytes.len() < 12
+        || bytes[0] != b'['
+        || bytes[3] != b':'
+        || bytes[6] != b':'
+        || bytes[9] != b']'
+        || bytes[10] != b' '
+    {
+        return None;
+    }
+    if !bytes[1..3]
+        .iter()
+        .chain(&bytes[4..6])
+        .chain(&bytes[7..9])
+        .all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let after = rest.get(11..)?;
+    let (location, tail) = after.split_once(": ")?;
+    let (path, line) = location.rsplit_once(':')?;
+    if path.is_empty() || path.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if line.is_empty() || !line.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(tail)
+}
+
+#[cfg(test)]
+mod tests {
+    use dynamo_backend_common::{BackendError, ErrorType};
+    use dynamo_llm::generate_format::WorkerError;
+
+    use super::{
+        EMPTY_ENUM, EMPTY_GRAMMAR, EMPTY_SCHEMA, INVALID_CONSTRAINT, INVALID_SCHEMA,
+        UNSATISFIABLE_SCHEMA, generation_status_to_dynamo,
+    };
+
+    fn invalid(message: &str) -> tonic_v14::Status {
+        tonic_v14::Status::new(tonic_v14::Code::InvalidArgument, message)
+    }
+
+    fn reason(message: &str) -> Option<String> {
+        generation_status_to_dynamo("GenerateStream", invalid(message))
+            .public_message()
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn recognized_grammar_rejection_publishes_a_safe_reason() {
+        let raw = "structured_outputs.grammar cannot be an empty string";
+        let error = generation_status_to_dynamo("GenerateStream", invalid(raw));
+        assert_eq!(
+            error.error_type(),
+            ErrorType::Backend(BackendError::InvalidArgument)
+        );
+        assert_eq!(error.public_message(), Some(EMPTY_GRAMMAR));
+        assert!(error.to_string().contains(raw));
+        assert!(error.to_string().contains("InvalidArgument"));
+
+        let encoded = serde_json::to_vec(&error).unwrap();
+        let decoded: dynamo_backend_common::DynamoError = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.public_message(), Some(EMPTY_GRAMMAR));
+        let surfaced = WorkerError::canonical_invalid_request_message(&decoded).unwrap();
+        assert_eq!(surfaced, EMPTY_GRAMMAR);
+        assert!(!surfaced.contains("structured_outputs"));
+    }
+
+    #[test]
+    fn recognized_schema_sentences_use_authored_reasons() {
+        assert_eq!(
+            reason("structured_outputs.json cannot be an empty string").as_deref(),
+            Some(EMPTY_SCHEMA)
+        );
+        assert_eq!(
+            reason("validator: enum array must not be empty").as_deref(),
+            Some(EMPTY_ENUM)
+        );
+        assert_eq!(
+            reason(
+                "Grammar error: Unsatisfiable schema: required property 'status' is unsatisfiable"
+            )
+            .as_deref(),
+            Some(UNSATISFIABLE_SCHEMA)
+        );
+        let schema = reason("invalid json schema: expected value at line 1 column 1").unwrap();
+        assert_eq!(schema, INVALID_SCHEMA);
+        assert!(!schema.contains("line 1"));
+        assert_eq!(
+            reason("Invalid JSON grammar specification.").as_deref(),
+            Some(INVALID_SCHEMA)
+        );
+        assert_eq!(
+            reason("structured_outputs.choice cannot be empty").as_deref(),
+            Some(INVALID_CONSTRAINT)
+        );
+    }
+
+    #[test]
+    fn compiler_locations_stay_private() {
+        let raw = "[07:13:49] /tmp/private/compiler.cc:1: Failed to transform json schema into a grammar: boom";
+        let error = generation_status_to_dynamo("GenerateStream", invalid(raw));
+        let public = error.public_message().unwrap();
+        assert_eq!(public, INVALID_CONSTRAINT);
+        assert!(!public.contains("/tmp"));
+        assert!(!public.contains("compiler.cc"));
+        assert!(!public.contains("boom"));
+        assert!(error.to_string().contains("/tmp/private/compiler.cc"));
+        let encoded = serde_json::to_string(&error).unwrap();
+        let decoded: dynamo_backend_common::DynamoError = serde_json::from_str(&encoded).unwrap();
+        let surfaced = WorkerError::canonical_invalid_request_message(&decoded).unwrap();
+        assert_eq!(surfaced, INVALID_CONSTRAINT);
+        assert!(!surfaced.contains("compiler.cc"));
+    }
+
+    #[test]
+    fn unknown_invalid_argument_and_other_statuses_stay_unchanged() {
+        let unknown = generation_status_to_dynamo(
+            "GenerateStream",
+            invalid("token 7 missing from /tmp/secret/model.json"),
+        );
+        assert_eq!(unknown.public_message(), None);
+        assert!(unknown.to_string().contains("/tmp/secret/model.json"));
+        assert_eq!(
+            WorkerError::canonical_invalid_request_message(&unknown).as_deref(),
+            Some("Invalid request")
+        );
+
+        let cancelled = generation_status_to_dynamo(
+            "GenerateStream",
+            tonic_v14::Status::new(
+                tonic_v14::Code::Cancelled,
+                "structured_outputs.grammar cannot be an empty string",
+            ),
+        );
+        assert_eq!(
+            cancelled.error_type(),
+            ErrorType::Backend(BackendError::Cancelled)
+        );
+        assert_eq!(cancelled.public_message(), None);
+
+        let broken = tonic_v14::Status::from_error(Box::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "structured_outputs.grammar cannot be an empty string",
+        )));
+        let disconnected = generation_status_to_dynamo("GenerateStream", broken);
+        assert_eq!(
+            disconnected.error_type(),
+            ErrorType::Backend(BackendError::Disconnected)
+        );
+        assert_eq!(disconnected.public_message(), None);
     }
 }

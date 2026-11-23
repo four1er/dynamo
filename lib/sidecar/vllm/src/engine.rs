@@ -1024,7 +1024,10 @@ impl LLMEngine for VllmSidecarEngine {
                         break;
                     }
                     Err(status) => {
-                        yield Err(client::stream_status_to_dynamo("GenerateStream", status));
+                        yield Err(client::generation_status_to_dynamo(
+                            "GenerateStream",
+                            status,
+                        ));
                         break;
                     }
                 }
