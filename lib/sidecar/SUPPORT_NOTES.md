@@ -12,7 +12,7 @@ Check the versions in your deployment.
 
 ## vLLM
 
-The standard generation path requires one completion per request (`n=1`). It accepts image, video, and audio input. It does not accept prompt embeddings or per-request `mm_processor_kwargs`. The sidecar provides basic structured output. It supports fewer constraint controls than the in-process backend.
+The standard generation path requires one completion per request (`n=1`). It accepts image, video, and audio input. It does not accept prompt embeddings or per-request `mm_processor_kwargs`. The sidecar provides basic structured output. It supports fewer constraint controls than the in-process backend. A recognized structured-output validation failure returns a fixed client-safe reason. Compiler locations and unrecognized gRPC diagnostics stay in the worker log.
 
 Runtime weight updates require the engine to report support for weight updates. Sleep and wake controls require engine support for sleep mode. Configure speculative decoding in the native engine. Test each model, algorithm, routing, disaggregation, and telemetry combination separately.
 

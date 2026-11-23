@@ -167,6 +167,7 @@ async fn registration_and_errors_recover_through_worker_ingress<F: ProcessFixtur
             RequestPlan {
                 open: OpenAction::Fail,
                 stream: None,
+                rejection: None,
             },
             BackendError::CannotConnect,
         ),
@@ -179,6 +180,7 @@ async fn registration_and_errors_recover_through_worker_ingress<F: ProcessFixtur
                     action: StreamAction::Fail,
                     pause: false,
                 }),
+                rejection: None,
             },
             F::read_error(),
         ),
@@ -191,6 +193,7 @@ async fn registration_and_errors_recover_through_worker_ingress<F: ProcessFixtur
                     action: StreamAction::Close,
                     pause: false,
                 }),
+                rejection: None,
             },
             F::eof_error(),
         ),
@@ -378,6 +381,150 @@ async fn vllm_native_errors_reach_http_and_recover() {
     .expect("HTTP error scenario exceeded its overall deadline");
 }
 
+const VLLM_COMPILER_STATUS: &str =
+    "[07:13:49] /tmp/private/compiler.cc:1: Failed to transform json schema into a grammar: boom";
+
+/// Recognized vLLM validation text reaches HTTP and SSE. Compiler paths and
+/// unknown diagnostics do not, and a later valid request still completes.
+#[tokio::test]
+async fn vllm_structured_output_reasons_reach_http() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let env = Environment::new().await;
+        let control = Controller::default();
+        let mut peer = vllm::Fixture::start(
+            control.clone(),
+            FixtureConfig {
+                model: env.model.clone(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut child =
+            env.spawn::<vllm::Fixture>(&peer.endpoint(), DisaggregationMode::Aggregated, 5);
+        let router = env.ready("backend").await;
+        let frontend = Frontend::start(&env).await;
+
+        let grammar = control.next_request(RequestPlan {
+            open: OpenAction::Reject,
+            rejection: Some("structured_outputs.grammar cannot be an empty string"),
+            ..Default::default()
+        });
+        let response = bounded(
+            "HTTP grammar rejection",
+            frontend.generate(&env.model, false).send(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["code"], 400, "{body}");
+        assert_eq!(
+            body["message"], "Invalid grammar: grammar must not be empty",
+            "{body}"
+        );
+        assert!(!body.to_string().contains("GenerateStream"), "{body}");
+        assert!(!body.to_string().contains("InvalidArgument"), "{body}");
+        bounded("grammar rejection release", grammar.wait(Event::Dropped)).await;
+        assert!(
+            router
+                .selectable_worker_ids()
+                .is_ok_and(|ids| !ids.is_empty()),
+            "a validation refusal must not quarantine the worker"
+        );
+
+        let compiler = control.next_request(RequestPlan {
+            stream: Some(StreamFault {
+                at: StreamPoint::TokenResponse(1),
+                action: StreamAction::Reject,
+                pause: false,
+            }),
+            rejection: Some(VLLM_COMPILER_STATUS),
+            ..Default::default()
+        });
+        let mut response = bounded(
+            "HTTP compiler rejection",
+            frontend.generate(&env.model, true).send(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let mut streamed = String::new();
+        bounded(
+            "HTTP client receives token before validation error",
+            async {
+                loop {
+                    let chunk = response.chunk().await.unwrap().expect("token chunk");
+                    streamed.push_str(&String::from_utf8_lossy(&chunk));
+                    if sse_events(&streamed).any(|event| {
+                        event["nvext"]["completion_token_ids"]
+                            .as_array()
+                            .is_some_and(|tokens| !tokens.is_empty())
+                    }) {
+                        break;
+                    }
+                }
+            },
+        )
+        .await;
+        streamed.push_str(
+            &bounded("HTTP compiler stream body", response.text())
+                .await
+                .unwrap(),
+        );
+        let errors: Vec<_> = sse_events(&streamed)
+            .filter_map(|event| event.get("error").cloned())
+            .collect();
+        assert_eq!(errors.len(), 1, "{streamed}");
+        assert_eq!(errors[0]["code"], 400, "{streamed}");
+        assert_eq!(
+            errors[0]["message"], "Invalid structured-output constraint",
+            "{streamed}"
+        );
+        assert!(!streamed.contains("/tmp/private"), "{streamed}");
+        assert!(!streamed.contains("compiler.cc"), "{streamed}");
+        assert!(!streamed.contains("Failed to transform"), "{streamed}");
+        bounded("compiler rejection release", compiler.wait(Event::Dropped)).await;
+        peer.scheduler_idle().await;
+
+        let unknown = control.next_request(RequestPlan {
+            open: OpenAction::Reject,
+            rejection: Some("token 7 missing from /tmp/secret/model.json"),
+            ..Default::default()
+        });
+        let response = bounded(
+            "HTTP unknown rejection",
+            frontend.generate(&env.model, false).send(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["message"], "Invalid request", "{body}");
+        assert!(!body.to_string().contains("/tmp/secret"), "{body}");
+        bounded("unknown rejection release", unknown.wait(Event::Dropped)).await;
+
+        let recovered = control.next_request(RequestPlan::default());
+        let response = bounded(
+            "HTTP request after validation errors",
+            frontend.generate(&env.model, false).send(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["choices"][0]["finish_reason"], "length", "{body}");
+        assert_eq!(recovered.tokens().len(), 3);
+        bounded("recovery release", recovered.wait(Event::Dropped)).await;
+
+        frontend.shutdown().await;
+        child.shutdown().await;
+        env.withdrawn("backend", &router).await;
+        peer.shutdown().await;
+    })
+    .await
+    .expect("structured-output HTTP scenario exceeded its overall deadline");
+}
+
 #[tokio::test]
 async fn sglang_native_errors_reach_http_and_recover() {
     tokio::time::timeout(
@@ -481,6 +628,7 @@ fn hold_after_token() -> RequestPlan {
             action: StreamAction::Continue,
             pause: true,
         }),
+        rejection: None,
     }
 }
 
@@ -518,6 +666,7 @@ async fn worker_cancel_and_consumer_drop_release_only_the_target<F: ProcessFixtu
             RequestPlan {
                 open: OpenAction::Hold,
                 stream: None,
+                rejection: None,
             }
         } else {
             hold_after_token()
@@ -1034,6 +1183,7 @@ async fn prefill_router_preserves_handoff_failure_and_cancellation<
             OpenAction::Continue
         },
         stream: None,
+        rejection: None,
     };
 
     for id in ["handoff", "handoff-repeat"] {
@@ -1074,6 +1224,7 @@ async fn prefill_router_preserves_handoff_failure_and_cancellation<
         RequestPlan {
             open: OpenAction::Fail,
             stream: None,
+            rejection: None,
         },
     );
     let unsubmitted = decode_control.request("failed-prefill", RequestPlan::default());
@@ -1118,6 +1269,7 @@ async fn prefill_router_preserves_handoff_failure_and_cancellation<
         RequestPlan {
             open: OpenAction::Hold,
             stream: None,
+            rejection: None,
         },
     );
     let request = env.request("cancel-handoff", 3);
